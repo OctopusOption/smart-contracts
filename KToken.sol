@@ -698,9 +698,13 @@ contract ERC20 is Context, IERC20 {
 contract KToken is ERC20 {
     using SafeMath for uint256;
     
-    string _underlying = 'ETH/USD';
-    uint _strike = 781;
+    string _underlying = 'ETH-USD';
+    uint _strike = 3405;
     uint _maturity = 1;
+    uint _expiresOn = 1621147083;
+    bool _isPut = true;
+    
+    address public minter;
     
     function getUnderlying() public view returns (string memory) {
         return _underlying;
@@ -714,8 +718,26 @@ contract KToken is ERC20 {
         return _maturity;
     }
 
-    constructor () ERC20('K-Token', 'KTK')
+    function getExpiresOn() public view returns (uint) {
+        return _expiresOn;
+    }
+    
+    function isPut() public view returns (bool) {
+        return _isPut;
+    }
+
+    function getDecimals() public view returns (uint) {
+        return decimals();
+    }
+    
+   function mint(address to, uint256 value) public {
+       require(msg.sender == minter, "Invalid caller");
+       
+        _mint(to, value);
+    }
+    
+    constructor(address _minter) ERC20('K-Token', 'KTK')
     {
-        _mint(msg.sender, 1000 * 10 ** uint(decimals()));
+        minter = _minter;
     }
 }
