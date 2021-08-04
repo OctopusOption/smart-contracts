@@ -1,190 +1,143 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.4;
+pragma solidity ^0.8.6;
 
-import "ERC20.sol";
-import "SafeERC20.sol";
-import "Ownable.sol";
+import "./ERC20.sol";
+import "./SafeERC20.sol";
+import "./Ownable.sol";
+import "./PriceConsumer.sol";
+import "./IUniswapV2Router02.sol";
+import "./ICETH.sol";
+import "./ICERC20.sol";
+import "./IKToken.sol";
 
-
-interface IOption {
-    function transfer(address to, uint256 value) external returns (bool);
-
-    function approve(address spender, uint256 value) external returns (bool);
-
-    function transferFrom(address from, address to, uint256 value) external returns (bool);
-
-    function totalSupply() external view returns (uint256);
-
-    function balanceOf(address who) external view returns (uint256);
-
-    function allowance(address owner, address spender) external view returns (uint256);
-
-    event Transfer(address indexed from, address indexed to, uint256 value);
-
-    event Approval(address indexed owner, address indexed spender, uint256 value);
-    
-    function mint(address account, uint256 amount) external;
-    
-    function getUnderlying() external view returns (string memory);
-    
-    function getStrike() external view returns (uint);
-
-    function getExpiresOn() external view returns (uint);
-    
-    function isPut() external view returns (bool);
-}
-
-interface IPriceConsumerV3EthUsd {
-    function getLatestPrice() external view returns (int);
-}
-
-interface IUniswapV2Router02 {
-    function swapETHForExactTokens(uint amountOut, address[] calldata path, address to, uint deadline)
-      external
-      payable
-      returns (uint[] memory amounts);
-      
-    function swapExactTokensForTokens(
-      uint amountIn,
-      uint amountOutMin,
-      address[] calldata path,
-      address to,
-      uint deadline
-    ) external returns (uint[] memory amounts);  
-    
-    function swapTokensForExactTokens(
-      uint amountOut,
-      uint amountInMax,
-      address[] calldata path,
-      address to,
-      uint deadline
-    ) external returns (uint[] memory amounts);
-      
-    function WETH() external returns (address); 
-    
-    function getAmountsIn(uint amountOut, address[] memory path) external view returns (uint[] memory amounts);
-    
-    function getAmountsOut(uint amountIn, address[] memory path) external view returns (uint[] memory amounts);
-    
-    function addLiquidity(
-      address tokenA,
-      address tokenB,
-      uint amountADesired,
-      uint amountBDesired,
-      uint amountAMin,
-      uint amountBMin,
-      address to,
-      uint deadline
-    ) external returns (uint amountA, uint amountB, uint liquidity);
-    
-    function swapExactETHForTokens(uint amountOutMin, address[] calldata path, address to, uint deadline)
-      external
-      payable
-      returns (uint[] memory amounts);
-}
 
 contract Octopus is Ownable {
-    IPriceConsumerV3EthUsd priceConsumer = IPriceConsumerV3EthUsd(0x17A8402bF6BeA74535c9ff69648EBb6Ede7399e3);
+    PriceConsumer priceConsumer = PriceConsumer(?);
     IUniswapV2Router02 uniswapRouter = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
-    IERC20 kiboToken =  IERC20(0xF096C24D20528bD45aC555F3c0cbf4F781316556);
-    ERC20 usdtToken = ERC20(0x8464c1368711F3A44d876e4359A8F67758609430);
+    IERC20 kiboToken =  IERC20(?);
+    ERC20 usdtToken = ERC20(?);
+    ERC20 wBTCToken = ERC20(?);
+    ERC20 polygonToken = ERC20(?);
+
+    address payable cETH = payable(?);
+    address cUSDT = ?;
+    address cwBTC = ?;
+
+    uint8 constant ETH = 1;
+    uint8 constant WBTC = 2;
+    uint8 constant POLYGON = 3;
+
+    uint256 public totalETHFees; // 18 decimals
+    uint256 public totalWBTCFees; // 8 decimals
+    uint256 public totalPOLYFees; // 18 decimals
+    uint256 public totalUSDTFees; // 6 decimals
 
     struct Seller {
         bool isValid;
-        uint256 collateral; //This is in USDT for PUT and in the underlying for CALL
-        uint256 notional;
+        uint256 collateral; // This is in USDT (6 decimals) for PUT and in the underlying (same decimals) for CALL
+        uint256 notional; // This has the same number of decimals as the underlying
         bool claimed;
+        uint256 cTokens; // All decimals
     }
     
     struct Option {
         bool isValid;
-        uint256 etherPriceInUSDTAtMaturity;
-        uint256 optionWorth;
+        uint256 spotPrice; // This has 6 decimals (we remove 2 when moving from USD to USDT)
+        uint256 optionWorth; // This has 6 decimals (same as above)
         mapping(address => Seller) sellers;
     }
     
-    mapping(address => Option) public options;
+    mapping(address => Option) options;
     mapping(address => uint256) public kiboRewards;
-
-    uint256 public totalFees;
 
     event OptionPurchase(address indexed option, address indexed buyer, uint256 weiNotional, uint256 usdtCollateral, uint256 premium);
     event RewardsIncreased(address indexed beneficiary, uint256 total);
     event RewardsWithdrawn(address indexed beneficiary, uint256 total);
     event ReturnedToSeller(address indexed option, address indexed seller, uint256 totalUSDTReturned, uint256 collateral, uint256 notional);
     event ReturnedToBuyer(address indexed option, address indexed buyer, uint256 totalUSDTReturned, uint256 _numberOfTokens);
-    event OptionFinalPriceSet(address indexed option, uint256 ethPriceInUsdt, uint256 optionWorthInUsdt);
-
-    function sell(address _optionAddress, uint256 _weiNotional) payable public {
+    event OptionFinalPriceSet(address indexed option, uint256 assetPriceInUsdt, uint256 optionWorthInUsdt);
+    
+    modifier validOption(address _optionAddress) {
         require(options[_optionAddress].isValid, "Invalid option");
-        require(IOption(_optionAddress).getExpiresOn() > block.timestamp, "Expired option");
-        
-        uint256 difference;
-        uint256 usdCollateral;
+        require(IKToken(_optionAddress).getExpiresOn() > block.timestamp, "Expired option");
+        _;
+    }
+
+    // Notional has the number of decimals of the underlying
+    function sell(address _optionAddress, uint256 _notional) payable external validOption(_optionAddress) {
+        Seller storage seller = options[_optionAddress].sellers[msg.sender];
+        uint8 underlying = IKToken(_optionAddress).getUnderlying();
+
+        uint256 usdtCollateral;
         uint256 feesToCollect;
-         
-        if (IOption(_optionAddress).isPut()) {
-            usdCollateral = calculateCollateralForPut(_optionAddress, _weiNotional);
-            SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), usdCollateral);
-        } else {
-            require(msg.value >= _weiNotional, 'Invalid collateral');
-            difference = msg.value - _weiNotional;
-            if (difference > 0) {
-                payable(msg.sender).transfer(difference);
+
+        if (IKToken(_optionAddress).isPut()) {
+            usdtCollateral = calculateCollateralForPut(_optionAddress, _notional);
+            SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), usdtCollateral);
+            //seller.cTokens += supplyErc20ToCompound(usdtToken, cUSDT, usdtCollateral);
+        } 
+        else {
+            if (underlying == ETH) {
+                require(msg.value == _notional, 'Invalid collateral');
+                //seller.cTokens += supplyEthToCompound(cETH, _notional);
+            }
+            else if (underlying == WBTC) {
+                SafeERC20.safeTransferFrom(wBTCToken, msg.sender, address(this), _notional);
+                //seller.cTokens += supplyErc20ToCompound(wBTCToken, cwBTC, _notional);
+            }
+            else if (underlying == POLYGON) {
+                SafeERC20.safeTransferFrom(polygonToken, msg.sender, address(this), _notional);
+                // There's no Polygon pool in Compound yet
             }
         }   
         
-        IOption(_optionAddress).mint(address(this), _weiNotional);
-        
-        Seller storage seller = options[_optionAddress].sellers[msg.sender];
+        if (underlying == ETH || underlying == POLYGON) {
+            IKToken(_optionAddress).mint(address(this), _notional / 1e14); // ETH and POLY have 18 decimals while KToken has 4
+        }
+        else if (underlying == WBTC) {
+            IKToken(_optionAddress).mint(address(this), _notional / 1e4); // WBTC has 8 decimals while KToken has 4
+        }
         
         //We sell the tokens for USDT in Uniswap, which is sent to the user
-        uint256 premium = sellTokensInUniswap(_optionAddress, _weiNotional);
+        uint256 premium = sellKTokensInUniswap(_optionAddress, _notional);
         
-        if (IOption(_optionAddress).isPut()) {
-            feesToCollect = usdCollateral / 100;
-            seller.collateral += usdCollateral - feesToCollect;
+        if (IKToken(_optionAddress).isPut()) {
+            feesToCollect = usdtCollateral / 100;
+            seller.collateral += usdtCollateral - feesToCollect;
+            totalUSDTFees += feesToCollect;
         } else {
-            feesToCollect = _weiNotional / 100;
-            seller.collateral += _weiNotional - feesToCollect;
+            feesToCollect = _notional / 100;
+            seller.collateral += _notional - feesToCollect;
+            if (underlying == ETH) {
+                totalETHFees += feesToCollect;
+            }
+            else if (underlying == WBTC) {
+                totalWBTCFees += feesToCollect;
+            }
+            else if (underlying == WBTC) {
+                totalPOLYFees += feesToCollect;
+            }
         }
 
-        totalFees += feesToCollect;
-        
         seller.isValid = true;
-        seller.notional += _weiNotional;
+        seller.notional += _notional;
         
         //We emit an event to be able to send KiboTokens offchain, according to the difference against the theoretical Premium
-        emit OptionPurchase(_optionAddress, msg.sender, _weiNotional, usdCollateral, premium);
+        emit OptionPurchase(_optionAddress, msg.sender, _notional, usdtCollateral, premium);
     }
     
-    function calculateCollateralForPut(address _optionAddress, uint256 _notionalInWei) public view returns (uint256) {
-        require(options[_optionAddress].isValid, "Invalid option");
-        return IOption(_optionAddress).getStrike() * _notionalInWei / 1e18;
-    }
-    
-    function claimCollateralAtMaturityForSellers(address _optionAddress) public {
-        require(options[_optionAddress].isValid, "Invalid option");
-        require(options[_optionAddress].etherPriceInUSDTAtMaturity > 0, "Still not ready");
+    // Collateral is always kept in USDT
+    function calculateCollateralForPut(address _optionAddress, uint256 _notional) public view returns (uint256) {
+        uint256 collateral = IKToken(_optionAddress).getStrike() * _notional;
         
-        Seller storage seller = options[_optionAddress].sellers[msg.sender];
+        // I still need to remove 2 decimals from the strike (as it is in USD, not USDT) and the notional decimals, which depend on the underlying
         
-        require(seller.isValid, "Seller not valid");
-        require(!seller.claimed, "Already claimed");
-        
-        uint256 totalToReturn = getHowMuchToClaimForSellers(_optionAddress, msg.sender);
-        require(totalToReturn > 0, 'Nothing to return');
-        
-        seller.claimed = true;
-
-        if (IOption(_optionAddress).isPut()) {
-            SafeERC20.safeTransfer(usdtToken, msg.sender, totalToReturn);
-        } else {
-            payable(msg.sender).transfer(totalToReturn);
+        if (IKToken(_optionAddress).getUnderlying() == ETH || IKToken(_optionAddress).getUnderlying() == POLYGON) {
+            return collateral / 1e20;
         }
         
-        emit ReturnedToSeller(_optionAddress, msg.sender, totalToReturn, seller.collateral, seller.notional);
+        return collateral / 1e10; // WBTC
     }
     
     function getHowMuchToClaimForSellers(address _optionAddress, address _seller) public view returns (uint256) {
@@ -192,46 +145,88 @@ contract Octopus is Ownable {
         if (seller.claimed) {
             return 0;
         }
-        uint256 optionWorth = options[_optionAddress].optionWorth;
-        uint256 amountToSubstract;
         
-        if (IOption(_optionAddress).isPut()) {
-            amountToSubstract = seller.notional * optionWorth / 1e18;
-        } else {
-            uint256 optionWorthInEth = optionWorth * 1e18 / (options[_optionAddress].etherPriceInUSDTAtMaturity * 1e6);
-            amountToSubstract = seller.notional * optionWorthInEth / 1e18;
+        uint256 optionWorth = options[_optionAddress].optionWorth; // This has 6 decimals as it is in USDT
+        // For CALL I need to convert the price from USDT to the underlying
+        if (!IKToken(_optionAddress).isPut()) {
+            optionWorth = optionWorth / options[_optionAddress].spotPrice;
         }
+        
+        uint256 amountToSubstract;
+        uint8 underlying = IKToken(_optionAddress).getUnderlying();
+        if (underlying == ETH || underlying == POLYGON) {
+            amountToSubstract = seller.notional * optionWorth / 1e18; // I take out the decimals from the notional
+        }
+        else if (underlying == WBTC) {
+            amountToSubstract = seller.notional * optionWorth / 1e8; // I take out the decimals from the notional
+        }
+        
         return seller.collateral - amountToSubstract;
     }
     
-    function getHowMuchToClaimForBuyers(address _optionAddress, uint256 _numberOfTokens) public view returns (uint256) {
-        uint256 optionWorth = options[_optionAddress].optionWorth;
-        if (IOption(_optionAddress).isPut()) {
-            return _numberOfTokens * optionWorth / 1e18;
-        } else {
-            uint256 optionWorthInEth = optionWorth * 1e18 / (options[_optionAddress].etherPriceInUSDTAtMaturity * 1e6);
-            return _numberOfTokens * optionWorthInEth / 1e18;
-        }
-    }
-    
-    function claimCollateralAtMaturityForBuyers(address _optionAddress, uint256 _numberOfTokens) public {
+    function claimCollateralAtMaturityForSellers(address _optionAddress) external {
         require(options[_optionAddress].isValid, "Invalid option");
-        require(options[_optionAddress].etherPriceInUSDTAtMaturity > 0, "Still not ready");
+        require(options[_optionAddress].spotPrice > 0, "Still not ready");
         
-        require(IERC20(_optionAddress).transferFrom(msg.sender, address(this), _numberOfTokens), "Transfer failed");
+        Seller storage seller = options[_optionAddress].sellers[msg.sender];
         
-        uint256 totalToReturn = getHowMuchToClaimForBuyers(_optionAddress, _numberOfTokens);
+        require(seller.isValid, "Seller not valid");
+        require(!seller.claimed, "Already claimed");
         
-        if (IOption(_optionAddress).isPut()) {
-            SafeERC20.safeTransfer(usdtToken, msg.sender, totalToReturn);
-        } else {
-            payable(msg.sender).transfer(totalToReturn);
-        }
+        uint256 totalToReturn = getHowMuchToClaimForSellers(_optionAddress, msg.sender); // This is in USDT for PUT and in the underlying for CALL
+        require(totalToReturn > 0, 'Nothing to return');
+        
+        seller.claimed = true;
 
-        emit ReturnedToBuyer(_optionAddress, msg.sender, totalToReturn, _numberOfTokens);
+        if (IKToken(_optionAddress).isPut()) {
+            //ICERC20 cToken = ICERC20(cUSDT);
+            //uint256 interests = seller.cTokens * cToken.exchangeRateCurrent() - seller.collateral;
+
+            //uint256 redeemResult = redeemICERC20Tokens(totalToReturn + interests, true, cUSDT);
+            //require(redeemResult == 0, "An error occurred");
+
+            SafeERC20.safeTransfer(usdtToken, msg.sender, totalToReturn); // + interests
+        } else {
+            //ICETH cToken = ICETH(cETH);
+            //uint256 interests = seller.cTokens * cToken.exchangeRateCurrent() - seller.collateral;
+            //uint256 redeemResult = redeemICETH(totalToReturn + interests, true, cETH);
+            //require(redeemResult == 0, "An error occurred");
+            
+            uint8 underlying = IKToken(_optionAddress).getUnderlying();
+            if (underlying == ETH) {
+                payable(msg.sender).transfer(totalToReturn);
+            }
+            else if (underlying == WBTC) {
+                SafeERC20.safeTransfer(wBTCToken, msg.sender, totalToReturn); // + interests
+            }
+            else if (underlying == POLYGON) {
+                SafeERC20.safeTransfer(polygonToken, msg.sender, totalToReturn); // + interests
+            }
+        }
+        
+        emit ReturnedToSeller(_optionAddress, msg.sender, totalToReturn, seller.collateral, seller.notional);
     }
     
-    function withdrawKiboTokens() public {
+    
+    function getHowMuchToClaimForBuyers(address _optionAddress, uint256 _numberOfKTokens) public view returns (uint256) {
+        uint256 optionWorth = options[_optionAddress].optionWorth; // This has 6 decimals as it is in USDT
+        return _numberOfKTokens * optionWorth / 1e4; // As KToken has 4 decimals
+    }
+    
+    function claimCollateralAtMaturityForBuyers(address _optionAddress, uint256 _numberOfKTokens) external {
+        require(options[_optionAddress].isValid, "Invalid option");
+        require(options[_optionAddress].spotPrice > 0, "Still not ready");
+        require(_numberOfKTokens > 0, "Invalid number of tokens");
+        
+        require(IERC20(_optionAddress).transferFrom(msg.sender, address(this), _numberOfKTokens), "Transfer failed");
+        
+        uint256 totalToReturn = getHowMuchToClaimForBuyers(_optionAddress, _numberOfKTokens);
+        SafeERC20.safeTransfer(usdtToken, msg.sender, totalToReturn);
+
+        emit ReturnedToBuyer(_optionAddress, msg.sender, totalToReturn, _numberOfKTokens);
+    }
+    
+    function withdrawKiboTokens() external {
         require(kiboRewards[msg.sender] > 0, "Nothing to withdraw");
         uint256 total = kiboRewards[msg.sender];
         kiboRewards[msg.sender] = 0;
@@ -242,7 +237,7 @@ contract Octopus is Ownable {
     // Public functions
     
     // Returns the amount in USDT if you sell 1 KiboToken in Uniswap
-    function getKiboSellPrice() public view returns (uint256) {
+    function getKiboSellPrice() external view returns (uint256) {
         address[] memory path = new address[](2);
         path[0] = address(kiboToken);
         path[1] = address(usdtToken);
@@ -251,7 +246,7 @@ contract Octopus is Ownable {
     }
     
     // Returns the amount in USDT if you buy 1 KiboToken in Uniswap
-    function getKiboBuyPrice() public view returns (uint256) {
+    function getKiboBuyPrice() external view returns (uint256) {
         address[] memory path = new address[](2);
         path[0] = address(usdtToken);
         path[1] = address(kiboToken);
@@ -261,7 +256,7 @@ contract Octopus is Ownable {
     
     // Internal functions
     
-    function sellTokensInUniswap(address _optionAddress, uint256 _tokensAmount) internal returns (uint256)  {
+    function sellKTokensInUniswap(address _optionAddress, uint256 _tokensAmount) internal returns (uint256)  {
         address[] memory path = new address[](2);
         path[0] = _optionAddress;
         path[1] = address(usdtToken);
@@ -286,78 +281,127 @@ contract Octopus is Ownable {
 
     //Admin functions
     
-    function _addKiboRewards(address _beneficiary, uint256 _total) public onlyOwner {
+    function _addKiboRewards(address _beneficiary, uint256 _total) external onlyOwner {
         kiboRewards[_beneficiary] += _total;
         emit RewardsIncreased(_beneficiary, _total);
     }
     
-    function _deactivateOption(address _optionAddress) public onlyOwner {
-        require(options[_optionAddress].isValid, "Already not activated");
+    function _deactivateOption(address _optionAddress) external onlyOwner {
+        require(options[_optionAddress].isValid, "It is not activated");
         options[_optionAddress].isValid = false;
     }
     
-    function _activateEthPutOption(address _optionAddress, uint256 _usdtCollateral, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens, bool _createPair) public onlyOwner {
-        require(IOption(_optionAddress).getExpiresOn() > block.timestamp, "Expired option");
-        require(!options[_optionAddress].isValid, "Already activated");
+    function _activatePutOption(address _optionAddress, uint256 _usdtCollateral, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) onlyOwner {
         require(_usdtCollateral > 0, "Collateral cannot be zero");
         require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
         require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
-        require(IOption(_optionAddress).isPut(), "Option is not PUT");
-        
+        require(IKToken(_optionAddress).isPut(), "Option is not PUT");
+
         options[_optionAddress].isValid = true;
 
-        IOption(_optionAddress).mint(address(this), _uniswapInitialTokens);
+        IKToken(_optionAddress).mint(address(this), _uniswapInitialTokens); // This has 4 decimals
         
         Seller storage seller = options[_optionAddress].sellers[msg.sender];
         seller.collateral = _usdtCollateral;
         seller.isValid = true;
-        seller.notional = _uniswapInitialTokens;
+        
+        uint8 underlying = IKToken(_optionAddress).getUnderlying();
+        if (underlying == ETH || underlying == POLYGON) {
+            seller.notional = _uniswapInitialTokens * 1e14; // KToken has 4 decimals and ETH and POLY have 18 decimals
+        }
+        else if (underlying == WBTC)
+        {
+            seller.notional = _uniswapInitialUSDT * 1e4; // KToken has 4 decimals and WBTC has 4 decimals            
+        }
+        else {
+            revert("Invalid underlying");
+        }
         
         SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), _uniswapInitialUSDT + _usdtCollateral);
-        
-        if (_createPair) {
-            createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
-        }
+        //seller.cTokens += supplyErc20ToCompound(usdtToken, cUSDT, _usdtCollateral);
+
+        createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
     }
     
-    function _activateEthCallOption(address _optionAddress, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens, bool _createPair) public payable onlyOwner {
-        require(IOption(_optionAddress).getExpiresOn() > block.timestamp, "Expired option");
-        require(!options[_optionAddress].isValid, "Already activated");
+    function _activateEthCallOption(address _optionAddress, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) payable onlyOwner {
         require(msg.value > 0, "Collateral cannot be zero");
         require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
         require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
-        require(!IOption(_optionAddress).isPut(), "Option is not CALL");
+        require(!IKToken(_optionAddress).isPut(), "Option is not CALL");
+        require(IKToken(_optionAddress).getUnderlying() == ETH, "Wrong underlying");
 
         options[_optionAddress].isValid = true;
 
-        IOption(_optionAddress).mint(address(this), _uniswapInitialTokens);
+        IKToken(_optionAddress).mint(address(this), _uniswapInitialTokens);
         
+        //seller.cTokens += supplyEthToCompound(cETH, msg.value);
+
+        SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
+
         Seller storage seller = options[_optionAddress].sellers[msg.sender];
         seller.collateral = msg.value;
         seller.isValid = true;
-        seller.notional = _uniswapInitialTokens;
+        seller.notional = _uniswapInitialTokens * 1e14; // KToken has 4 decimals and ETH has 18 decimals
         
-        SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
-        
-        if (_createPair) {
-            createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
-        }
+        createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
     }
     
-    function _setEthFinalPriceAtMaturity(address _optionAddress) public onlyOwner {
-        require(options[_optionAddress].isValid, "Invalid option");
-        require(options[_optionAddress].etherPriceInUSDTAtMaturity == 0, "Already set");
-        require(IOption(_optionAddress).getExpiresOn() < block.timestamp, "Still not expired");
-        
-        //Gets the price in WEI for 1 usdtToken
-        uint256 usdPriceOfEth = uint256(priceConsumer.getLatestPrice());
-        //I need the price in USDT for 1 ETH
-        uint256 spotPrice = uint256(1 ether) / usdPriceOfEth;
-        uint256 strike = IOption(_optionAddress).getStrike();
+    function _activatewBTCCallOption(address _optionAddress, uint256 _collateral, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) payable onlyOwner {
+        require(_collateral > 0, "Collateral cannot be zero");
+        require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
+        require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
+        require(!IKToken(_optionAddress).isPut(), "Option is not CALL");
+        require(IKToken(_optionAddress).getUnderlying() == WBTC, "Wrong underlying");
 
-        uint256 optionWorth = 0;
+        options[_optionAddress].isValid = true;
+
+        IKToken(_optionAddress).mint(address(this), _uniswapInitialTokens);
         
-        bool isPut = IOption(_optionAddress).isPut();
+        //seller.cTokens += supplyErc20ToCompound(wBTCToken, cwBTC, _collateral);
+
+        SafeERC20.safeTransferFrom(wBTCToken, msg.sender, address(this), _collateral);
+        SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
+
+        Seller storage seller = options[_optionAddress].sellers[msg.sender];
+        seller.collateral = _collateral;
+        seller.isValid = true;
+        seller.notional = _uniswapInitialTokens * 1e4; // KToken has 4 decimals and ETH has 8 decimals
+        
+        createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
+    }
+    
+    function _activatePolygonCallOption(address _optionAddress, uint256 _collateral, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) payable onlyOwner {
+        require(_collateral > 0, "Collateral cannot be zero");
+        require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
+        require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
+        require(!IKToken(_optionAddress).isPut(), "Option is not CALL");
+        require(IKToken(_optionAddress).getUnderlying() == POLYGON, "Wrong underlying");
+
+        options[_optionAddress].isValid = true;
+
+        IKToken(_optionAddress).mint(address(this), _uniswapInitialTokens);
+        
+        SafeERC20.safeTransferFrom(polygonToken, msg.sender, address(this), _collateral);
+        SafeERC20.safeTransferFrom(usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
+
+        Seller storage seller = options[_optionAddress].sellers[msg.sender];
+        seller.collateral = _collateral;
+        seller.isValid = true;
+        seller.notional = _uniswapInitialTokens * 1e14; // KToken has 4 decimals and POLY has 18 decimals
+        
+        createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
+    }
+    
+    function _setFinalPriceAtMaturity(address _optionAddress) external onlyOwner {
+        require(options[_optionAddress].isValid, "Invalid option");
+        require(options[_optionAddress].spotPrice == 0, "Already set");
+        require(IKToken(_optionAddress).getExpiresOn() < block.timestamp, "Still not expired");
+        
+        uint256 spotPrice = priceConsumer.getSpotPrice(IKToken(_optionAddress).getUnderlying()); // In USD, 8 decimals
+        uint256 strike = IKToken(_optionAddress).getStrike(); // In USD, 8 decimals
+        bool isPut = IKToken(_optionAddress).isPut();
+        
+        uint256 optionWorth = 0;
     
         if (isPut && spotPrice < strike) {
             optionWorth = strike - spotPrice;
@@ -366,38 +410,139 @@ contract Octopus is Ownable {
             optionWorth = spotPrice - strike;
         }
         
-        options[_optionAddress].etherPriceInUSDTAtMaturity = spotPrice;
-        options[_optionAddress].optionWorth = optionWorth * 1e6;
+        optionWorth = optionWorth / 100; // I remove the extra 2 decimals to make it in USDT
+        spotPrice = spotPrice / 100; // I remove the extra 2 decimals to make it in USDT
+        
+        options[_optionAddress].spotPrice = spotPrice;
+        options[_optionAddress].optionWorth = optionWorth;
         
         emit OptionFinalPriceSet(_optionAddress, spotPrice, optionWorth);
     }
     
-    function _withdrawFees() public onlyOwner {
-        require(totalFees > 0, 'Nothing to claim');
-        uint256 amount = totalFees;
-        totalFees = 0;
+    function _withdrawUSDTFees() external onlyOwner {
+        require(totalUSDTFees > 0, 'Nothing to claim');
+        uint256 amount = totalUSDTFees;
+        totalUSDTFees = 0;
+        SafeERC20.safeTransfer(usdtToken, msg.sender, amount);
+    }
+    
+    function _withdrawWBTCFees() external onlyOwner {
+        require(totalWBTCFees > 0, 'Nothing to claim');
+        uint256 amount = totalWBTCFees;
+        totalWBTCFees = 0;
+        SafeERC20.safeTransfer(wBTCToken, msg.sender, amount);
+    }
+
+    function _withdrawPOLYFees() external onlyOwner {
+        require(totalPOLYFees > 0, 'Nothing to claim');
+        uint256 amount = totalPOLYFees;
+        totalPOLYFees = 0;
+        SafeERC20.safeTransfer(polygonToken, msg.sender, amount);
+    }
+
+    function _withdrawETHFees() external onlyOwner {
+        require(totalETHFees > 0, 'Nothing to claim');
+        uint256 amount = totalETHFees;
+        totalETHFees = 0;
         payable(msg.sender).transfer(amount);
     }
 
-    function _withdrawETH(uint256 _amount) public onlyOwner {
-        payable(msg.sender).transfer(_amount);
-    }
-    
-    function _withdrawUSDT(uint256 _amount) public onlyOwner {
-        SafeERC20.safeTransfer(usdtToken, msg.sender, _amount);
-    }
-    
-    function _withdrawKibo(uint256 _amount) public onlyOwner {
+    function _withdrawKibo(uint256 _amount) external onlyOwner {
         SafeERC20.safeTransfer(kiboToken, msg.sender, _amount);
     }
     
-    function getOption(address _optionAddress) public view returns (bool _isValid, bool _isPut, uint256 _etherPriceInUSDTAtMaturity, uint256 _optionWorth) {
-        return (options[_optionAddress].isValid, IOption(_optionAddress).isPut(), options[_optionAddress].etherPriceInUSDTAtMaturity, options[_optionAddress].optionWorth);
+    function getOption(address _optionAddress) external view returns (bool _isValid, bool _isPut, uint256 _spotPrice, uint256 _optionWorth) {
+        return (options[_optionAddress].isValid, IKToken(_optionAddress).isPut(), options[_optionAddress].spotPrice, options[_optionAddress].optionWorth);
     }
     
-    function getSeller(address _optionAddress, address _seller) public view returns (bool _isValid, uint256 _collateral, uint256 _notional, bool _claimed) {
+    function getSeller(address _optionAddress, address _seller) external view returns (bool _isValid, uint256 _collateral, uint256 _notional, bool _claimed, uint256 _cTokens) {
         Seller memory seller = options[_optionAddress].sellers[_seller];
-        return (seller.isValid, seller.collateral, seller.notional, seller.claimed);
+        return (seller.isValid, seller.collateral, seller.notional, seller.claimed, seller.cTokens);
+    }
+
+    //Compound
+    
+     function supplyEthToCompound(address payable _cEtherContract, uint256 _total)
+        internal
+        returns (uint256)
+    {
+        // Create a reference to the corresponding cToken contract
+        ICETH cToken = ICETH(_cEtherContract);
+
+        uint256 balance = cToken.balanceOf(address(this));
+
+        cToken.mint{value:_total, gas: 250000}();
+        return cToken.balanceOf(address(this)) - balance;
+    }
+    
+    function supplyErc20ToCompound(
+        ERC20 _erc20Contract,
+        address _ICERC20Contract,
+        uint256 _numTokensToSupply
+    ) internal returns (uint) {
+        // Create a reference to the corresponding cToken contract, like cDAI
+        ICERC20 cToken = ICERC20(_ICERC20Contract);
+
+        uint256 balance = cToken.balanceOf(address(this));
+
+        // Approve transfer on the ERC20 contract
+        SafeERC20.safeApprove(_erc20Contract, _ICERC20Contract, _numTokensToSupply);
+
+        // Mint cTokens
+        cToken.mint(_numTokensToSupply);
+        
+        uint256 newBalance = cToken.balanceOf(address(this));
+
+        return newBalance - balance;
+    }
+    
+    function redeemICERC20Tokens(
+        uint256 amount,
+        bool redeemType,
+        address _ICERC20Contract
+    ) internal returns (uint256) {
+        // Create a reference to the corresponding cToken contract, like cDAI
+        ICERC20 cToken = ICERC20(_ICERC20Contract);
+
+        // `amount` is scaled up, see decimal table here:
+        // https://compound.finance/docs#protocol-math
+
+        uint256 redeemResult;
+
+        if (redeemType == true) {
+            // Retrieve your asset based on a cToken amount
+            redeemResult = cToken.redeem(amount);
+        } else {
+            // Retrieve your asset based on an amount of the asset
+            redeemResult = cToken.redeemUnderlying(amount);
+        }
+
+        return redeemResult;
+    }
+
+    function redeemICETH(
+        uint256 amount,
+        bool redeemType,
+        address _cEtherContract
+    ) internal returns (uint256) {
+        // Create a reference to the corresponding cToken contract
+        ICETH cToken = ICETH(_cEtherContract);
+
+        // `amount` is scaled up by 1e18 to avoid decimals
+
+        uint256 redeemResult;
+
+        if (redeemType == true) {
+            // Retrieve your asset based on a cToken amount
+            redeemResult = cToken.redeem(amount);
+        } else {
+            // Retrieve your asset based on an amount of the asset
+            redeemResult = cToken.redeemUnderlying(amount);
+        }
+
+        // Error codes are listed here:
+        // https://compound.finance/docs/ctokens#ctoken-error-codes
+        return redeemResult;
     }
 
     receive() external payable {
