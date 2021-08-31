@@ -4,7 +4,6 @@ pragma solidity ^0.8.4;
 
 import "./ERC20.sol";
 
-
 contract KiboToken is ERC20 {
     
     /// @notice Address which may mint new tokens

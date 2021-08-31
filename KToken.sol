@@ -10,6 +10,7 @@ contract KToken is ERC20 {
     uint8 constant POLYGON = 3;
     
     uint8 _underlying = ETH; 
+    
     uint _strike = ?; // This has 8 decimals and represents the value in USD
     uint _maturity = ?;
     uint _expiresOn = ?;
