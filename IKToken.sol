@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.6;
+pragma solidity ^0.8.7;
 
 interface IKToken {
     function transfer(address to, uint256 value) external returns (bool);
@@ -21,7 +21,7 @@ interface IKToken {
     
     function mint(address account, uint256 amount) external;
     
-    function getUnderlying() external view returns (uint8);
+    function getUnderlying() external view returns (address);
     
     function getStrike() external view returns (uint);
 

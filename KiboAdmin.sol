@@ -6,7 +6,6 @@ pragma solidity ^0.8.7;
 import "./SafeERC20.sol";
 import "./Ownable.sol";
 import "./KiboStorage.sol";
-import "./IKToken.sol";
 import "./KiboConstants.sol";
 import "./KiboUniswap.sol";
 import "./PriceConsumer.sol";
@@ -21,6 +20,17 @@ contract KiboAdmin is Ownable, KiboStorage, KiboUniswap {
         _;
     }
     
+    function _enableUnderlying(address _underlying, address _cToken, bool _stakeCollateral, address _priceConsumer) external onlyOwner {
+        underlyings[_underlying].isActive = true;
+        underlyings[_underlying].cToken = _cToken;
+        underlyings[_underlying].stakeCollateral = _stakeCollateral;
+        underlyings[_underlying].priceConsumer = _priceConsumer;
+    }
+
+    function _disableUnderlying(address _underlying) external onlyOwner {
+        underlyings[_underlying].isActive = false;
+    }
+    
     function _deactivateOption(address _optionAddress) external onlyOwner {
         require(options[_optionAddress].isValid, "It is not activated");
         options[_optionAddress].isValid = false;
@@ -31,6 +41,8 @@ contract KiboAdmin is Ownable, KiboStorage, KiboUniswap {
         require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
         require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
         require(IKToken(_optionAddress).isPut(), "Option is not PUT");
+        address underlying = IKToken(_optionAddress).getUnderlying();
+        require(underlyings[underlying].isActive, "Invalid underlying");
 
         options[_optionAddress].isValid = true;
 
@@ -40,17 +52,11 @@ contract KiboAdmin is Ownable, KiboStorage, KiboUniswap {
         seller.collateral = _usdtCollateral;
         seller.isValid = true;
         
-        uint8 underlying = IKToken(_optionAddress).getUnderlying();
-        if (underlying == KiboConstants.ETH || underlying == KiboConstants.POLYGON) {
-            seller.notional = _uniswapInitialTokens * 1e14; // KToken has 4 decimals and ETH and POLY have 18 decimals
+        uint256 decimals = 18;
+        if (underlying != address(0)) {
+            decimals = ERC20(underlying).decimals();
         }
-        else if (underlying == KiboConstants.WBTC)
-        {
-            seller.notional = _uniswapInitialUSDT * 1e4; // KToken has 4 decimals and WBTC has 4 decimals            
-        }
-        else {
-            revert("Invalid underlying");
-        }
+        seller.notional = _uniswapInitialTokens * 10 ** (decimals-4);
         
         SafeERC20.safeTransferFrom(KiboConstants.usdtToken, msg.sender, address(this), _uniswapInitialUSDT + _usdtCollateral);
         //seller.cTokens += supplyErc20ToCompound(usdtToken, cUSDT, _usdtCollateral);
@@ -58,12 +64,18 @@ contract KiboAdmin is Ownable, KiboStorage, KiboUniswap {
         createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
     }
     
-    function _activateEthCallOption(address _optionAddress, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) payable onlyOwner {
-        require(msg.value > 0, "Collateral cannot be zero");
+    function _activateCallOption(address _optionAddress, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens, uint256 _collateral) external validOption(_optionAddress) payable onlyOwner {
         require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
         require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
         require(!IKToken(_optionAddress).isPut(), "Option is not CALL");
-        require(IKToken(_optionAddress).getUnderlying() == KiboConstants.ETH, "Wrong underlying");
+        address underlying = IKToken(_optionAddress).getUnderlying();
+        require(underlyings[underlying].isActive, "Invalid underlying");
+        
+        if (underlying != address(0)) {
+            require(_collateral > 0, "Collateral cannot be zero");
+        } else  {
+            require(msg.value > 0, "Collateral cannot be zero");
+        }
 
         options[_optionAddress].isValid = true;
 
@@ -74,55 +86,17 @@ contract KiboAdmin is Ownable, KiboStorage, KiboUniswap {
         SafeERC20.safeTransferFrom(KiboConstants.usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
 
         Seller storage seller = options[_optionAddress].sellers[msg.sender];
-        seller.collateral = msg.value;
+
+        uint256 decimals = 18;
+        if (underlying != address(0)) {
+            decimals = ERC20(underlying).decimals();
+            SafeERC20.safeTransferFrom(ERC20(underlying), msg.sender, address(this), _collateral);
+        } else  {
+            seller.collateral = msg.value;
+        }
+
         seller.isValid = true;
-        seller.notional = _uniswapInitialTokens * 1e14; // KToken has 4 decimals and ETH has 18 decimals
-        
-        createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
-    }
-    
-    function _activatewBTCCallOption(address _optionAddress, uint256 _collateral, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) payable onlyOwner {
-        require(_collateral > 0, "Collateral cannot be zero");
-        require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
-        require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
-        require(!IKToken(_optionAddress).isPut(), "Option is not CALL");
-        require(IKToken(_optionAddress).getUnderlying() == KiboConstants.WBTC, "Wrong underlying");
-
-        options[_optionAddress].isValid = true;
-
-        IKToken(_optionAddress).mint(address(this), _uniswapInitialTokens);
-        
-        //seller.cTokens += supplyErc20ToCompound(wBTCToken, cwBTC, _collateral);
-
-        SafeERC20.safeTransferFrom(KiboConstants.wBTCToken, msg.sender, address(this), _collateral);
-        SafeERC20.safeTransferFrom(KiboConstants.usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
-
-        Seller storage seller = options[_optionAddress].sellers[msg.sender];
-        seller.collateral = _collateral;
-        seller.isValid = true;
-        seller.notional = _uniswapInitialTokens * 1e4; // KToken has 4 decimals and ETH has 8 decimals
-        
-        createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
-    }
-    
-    function _activatePolygonCallOption(address _optionAddress, uint256 _collateral, uint256 _uniswapInitialUSDT, uint256 _uniswapInitialTokens) external validOption(_optionAddress) payable onlyOwner {
-        require(_collateral > 0, "Collateral cannot be zero");
-        require(_uniswapInitialUSDT > 0, "Uniswap USDT cannot be zero");
-        require(_uniswapInitialTokens > 0, "Uniswap tokens cannot be zero");
-        require(!IKToken(_optionAddress).isPut(), "Option is not CALL");
-        require(IKToken(_optionAddress).getUnderlying() == KiboConstants.POLYGON, "Wrong underlying");
-
-        options[_optionAddress].isValid = true;
-
-        IKToken(_optionAddress).mint(address(this), _uniswapInitialTokens);
-        
-        SafeERC20.safeTransferFrom(KiboConstants.polygonToken, msg.sender, address(this), _collateral);
-        SafeERC20.safeTransferFrom(KiboConstants.usdtToken, msg.sender, address(this), _uniswapInitialUSDT);
-
-        Seller storage seller = options[_optionAddress].sellers[msg.sender];
-        seller.collateral = _collateral;
-        seller.isValid = true;
-        seller.notional = _uniswapInitialTokens * 1e14; // KToken has 4 decimals and POLY has 18 decimals
+        seller.notional = _uniswapInitialTokens * 10 ** (decimals-4); // KToken has 4 decimals. We deduce 4 from the underlying's number of decimals
         
         createPairInUniswap(_optionAddress, _uniswapInitialTokens, _uniswapInitialUSDT);
     }

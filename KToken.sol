@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: MIT
 
-pragma solidity ^0.8.6;
+pragma solidity ^0.8.7;
 
 import "./ERC20.sol";
 
 contract KToken is ERC20 {
-    uint8 constant ETH = 1;
-    uint8 constant WBTC = 2;
-    uint8 constant POLYGON = 3;
-    
-    uint8 _underlying = ETH; 
-    
+    address _underlying = ?; //Use 0x0000000000000000000000000000000000000000 for ETH
     uint _strike = ?; // This has 8 decimals and represents the value in USD
     uint _maturity = ?;
     uint _expiresOn = ?;
     bool _isPut = ?;
     
-    address public minter = ?; //This is the Octopus smart contract
+    address public minter = ?; //This is the KiboFinance smart contract
     
-    function getUnderlying() public view returns (uint8) {
+    function getUnderlying() public view returns (address) {
         return _underlying;
     }
     

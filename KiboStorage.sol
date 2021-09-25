@@ -4,6 +4,7 @@ pragma solidity ^0.8.7;
 
 import "./IKToken.sol";
 
+
 contract KiboStorage {
     struct Seller {
         bool isValid;
@@ -20,7 +21,15 @@ contract KiboStorage {
         mapping(address => Seller) sellers;
     }
     
+    struct Underlying {
+        bool isActive;
+        address cToken;
+        bool stakeCollateral;
+        address priceConsumer;
+    }
+    
     mapping(address => Option) options;
+    mapping(address => Underlying) underlyings;
     
     function getOption(address _optionAddress) external view returns (bool _isValid, bool _isPut, uint256 _spotPrice, uint256 _optionWorth) {
         return (options[_optionAddress].isValid, IKToken(_optionAddress).isPut(), options[_optionAddress].spotPrice, options[_optionAddress].optionWorth);
